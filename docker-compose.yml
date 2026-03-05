@@ -1,0 +1,72 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════
+#  Smart City ANPR System — Docker Compose
+#
+#  Quick start (CPU):
+#    docker-compose up
+#
+#  With GPU (requires nvidia-container-toolkit):
+#    docker-compose -f docker-compose.yml -f docker-compose.gpu.yml up
+# ══════════════════════════════════════════════════════════════════
+
+services:
+  anpr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: anpr-system:latest
+    container_name: anpr-smart-city
+
+    # Volume mounts — persists outputs and allows live model reload
+    volumes:
+      - ./outputs:/app/outputs
+      - ./models_cache:/root/.cache         # cache YOLO + ESRGAN weights
+      - /etc/localtime:/etc/localtime:ro    # sync container timezone
+
+    ports:
+      - "8000:8000"     # REST API
+
+    environment:
+      - ANPR_CAMERA_ID=CCTV-001
+      - ANPR_CONF_THRESH=0.40
+      - ANPR_GENAI=true
+      - ANPR_DEVICE=auto
+      - ANPR_OUTPUT_DIR=/app/outputs
+      # Alert credentials (optional — set in .env file)
+      - ANPR_ALERT_SMTP_HOST=${ANPR_ALERT_SMTP_HOST:-smtp.gmail.com}
+      - ANPR_ALERT_SMTP_PORT=${ANPR_ALERT_SMTP_PORT:-587}
+      - ANPR_ALERT_SMTP_USER=${ANPR_ALERT_SMTP_USER:-}
+      - ANPR_ALERT_SMTP_PASS=${ANPR_ALERT_SMTP_PASS:-}
+      - ANPR_ALERT_EMAIL_FROM=${ANPR_ALERT_EMAIL_FROM:-}
+      - ANPR_ALERT_EMAIL_TO=${ANPR_ALERT_EMAIL_TO:-}
+      - ANPR_TWILIO_SID=${ANPR_TWILIO_SID:-}
+      - ANPR_TWILIO_TOKEN=${ANPR_TWILIO_TOKEN:-}
+      - ANPR_ALERT_SMS_TO=${ANPR_ALERT_SMS_TO:-}
+      - ANPR_ALERT_SMS_FROM=${ANPR_ALERT_SMS_FROM:-}
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Resource limits (adjust for your hardware)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+
+  # Optional: Prometheus metrics exporter (future extension)
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"
