@@ -20,6 +20,9 @@ class Settings:
     iou_thresh: float = 0.45    # YOLO NMS IoU
     device: str = "auto"        # auto | cpu | cuda | mps
     esrgan_scale: int = 4       # Real-ESRGAN upscale factor
+    esrgan_tile: int = 0        # tile size (0 = auto; set 256 for low VRAM)
+    detector_model: str = "yolov9c"   # yolov9c | yolov9e | yolov8n fallback
+    ocr_languages: list = field(default_factory=lambda: ["en"])
 
     # ── Safety compliance thresholds ──────────────────────────────
     helmet_conf: float = 0.55   # min confidence to flag no-helmet
@@ -38,6 +41,23 @@ class Settings:
     # ── Heatmap (Sprint 3) ────────────────────────────────────────
     enable_heatmap: bool = False
 
+    # ── Alerts (Sprint 3) ─────────────────────────────────────────
+    enable_alerts: bool = False
+    alert_repeat_threshold: int = 3   # violations before alert fires
+    alert_smtp_host: str = ""
+    alert_smtp_port: int = 587
+    alert_smtp_user: str = ""
+    alert_smtp_pass: str = ""
+    alert_email_from: str = ""
+    alert_email_to: str = ""
+    alert_twilio_sid: str = ""
+    alert_twilio_token: str = ""
+    alert_sms_to: str = ""
+    alert_sms_from: str = ""
+
+    # ── UI / Display ──────────────────────────────────────────────
+    show_plate_crop: bool = True   # show inset plate thumbnail in GUI/annotator
+
     # ── Output ────────────────────────────────────────────────────
     output_dir: str = "outputs"
     save_violations: bool = True
@@ -46,6 +66,26 @@ class Settings:
         # Convert numeric string source to int (webcam index)
         if isinstance(self.source, str) and self.source.isdigit():
             self.source = int(self.source)
+
+        # Load alert credentials from environment if not set
+        def _env(attr: str, env_key: str):
+            if not getattr(self, attr):
+                val = os.environ.get(env_key, "")
+                if val:
+                    setattr(self, attr, val)
+
+        _env("alert_smtp_host",   "ANPR_ALERT_SMTP_HOST")
+        _env("alert_smtp_user",   "ANPR_ALERT_SMTP_USER")
+        _env("alert_smtp_pass",   "ANPR_ALERT_SMTP_PASS")
+        _env("alert_email_from",  "ANPR_ALERT_EMAIL_FROM")
+        _env("alert_email_to",    "ANPR_ALERT_EMAIL_TO")
+        _env("alert_twilio_sid",  "ANPR_TWILIO_SID")
+        _env("alert_twilio_token","ANPR_TWILIO_TOKEN")
+        _env("alert_sms_to",      "ANPR_ALERT_SMS_TO")
+        _env("alert_sms_from",    "ANPR_ALERT_SMS_FROM")
+        smtp_port_env = os.environ.get("ANPR_ALERT_SMTP_PORT", "")
+        if smtp_port_env.isdigit():
+            self.alert_smtp_port = int(smtp_port_env)
 
         # Resolve device
         if self.device == "auto":
