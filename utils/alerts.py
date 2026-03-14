@@ -1,165 +1,164 @@
 """
-utils/alerts.py — Email and SMS alert system for repeat violators.
+utils/alerts.py — Email + SMS repeat-violator alert system (Sprint 3).
 
-Sends an alert when the same plate accumulates >= THRESHOLD violations
-within a rolling time window.  Uses SMTP for email (supports Gmail/Outlook)
-and Twilio REST API for SMS.  All credentials are read from environment
-variables or the Settings object — never hardcoded.
+Tracks per-plate violation counts and fires SMTP email + Twilio SMS
+when a plate reaches the configured threshold within a session.
 
-Environment variables (optional):
-    ANPR_ALERT_EMAIL_FROM    sender email address
-    ANPR_ALERT_EMAIL_TO      comma-separated recipient emails
-    ANPR_ALERT_SMTP_HOST     default: smtp.gmail.com
-    ANPR_ALERT_SMTP_PORT     default: 587
-    ANPR_ALERT_SMTP_USER     SMTP auth username
-    ANPR_ALERT_SMTP_PASS     SMTP auth password
-
-    ANPR_ALERT_SMS_TO        Twilio: recipient phone (+91...)
-    ANPR_ALERT_SMS_FROM      Twilio: sender phone
-    ANPR_TWILIO_SID          Twilio account SID
-    ANPR_TWILIO_TOKEN        Twilio auth token
+Design:
+  • No external state — counts reset on process restart (stateless between sessions)
+  • Alert fires exactly once per plate per session (no duplicate spam)
+  • SMTP and SMS are independent — one can succeed while the other fails
+  • All credentials loaded from Settings (which reads env vars)
+  • Fully testable without credentials (threshold logic is pure Python)
 """
+
 from __future__ import annotations
-import os, logging, smtplib, threading
-from email.mime.text    import MIMEText
+import logging
+import smtplib
+import threading
+from collections import defaultdict
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
-from collections        import defaultdict, deque
-from datetime           import datetime, timedelta
+from email.mime.text import MIMEText
 
 log = logging.getLogger("AlertSystem")
-
-# Repeat-violator threshold: trigger alert after this many violations
-_REPEAT_THRESHOLD = 3
-# Rolling window in minutes
-_WINDOW_MINUTES   = 60
 
 
 class AlertSystem:
     """
-    Tracks violations per plate and fires email / SMS alerts for repeat offenders.
+    Tracks violations per plate and fires alerts at threshold.
 
-    Usage::
-        alerts = AlertSystem()
-        alerts.record(plate="MH12AB1234", violation="No Helmet", camera="CCTV-001")
+    Parameters
+    ----------
+    threshold : int
+        Number of confirmed violations before an alert is sent.
+    settings  : Settings | None
+        Runtime config containing SMTP/Twilio credentials.
+        If None, alerts are logged but not actually sent (test mode).
     """
 
-    def __init__(self, threshold: int = _REPEAT_THRESHOLD,
-                 window_minutes: int = _WINDOW_MINUTES):
+    def __init__(self, threshold: int = 3, settings=None):
         self.threshold = threshold
-        self.window    = timedelta(minutes=window_minutes)
-        # plate → deque of (datetime, violation_str)
-        self._history: dict[str, deque] = defaultdict(lambda: deque(maxlen=50))
-        self._alerted: set[str] = set()
-        self._lock = threading.Lock()
+        self.cfg       = settings
+        self._counts:   dict[str, int] = defaultdict(int)
+        self._alerted:  set[str]       = set()
+        self._lock      = threading.Lock()
 
-    def record(self, plate: str, violation: str, camera: str = "") -> bool:
+    # ── Public API ──────────────────────────────────────────────────
+
+    def record(self, plate: str, violation: str) -> bool:
         """
-        Record a violation event. Returns True if an alert was triggered.
-        Thread-safe.
+        Record a violation event for plate.
+
+        Returns True the first time the threshold is reached (alert fires).
+        Returns False for all subsequent calls after the alert has fired.
         """
-        plate = plate.upper().strip()
-        now   = datetime.now()
+        key = f"{plate}:{violation}"
         with self._lock:
-            self._history[plate].append((now, violation))
-            # Count events inside the rolling window
-            recent = [
-                (t, v) for t, v in self._history[plate]
-                if now - t <= self.window
-            ]
-            if len(recent) >= self.threshold and plate not in self._alerted:
-                self._alerted.add(plate)
-                log.warning(
-                    f"REPEAT VIOLATOR: {plate} — {len(recent)} violations "
-                    f"in {self.window.seconds//60} min. Sending alert."
-                )
-                # Fire alert in background thread
-                threading.Thread(
-                    target=self._send_alert,
-                    args=(plate, recent, camera),
-                    daemon=True,
-                ).start()
+            if key in self._alerted:
+                return False
+            self._counts[key] += 1
+            if self._counts[key] >= self.threshold:
+                self._alerted.add(key)
+                self._dispatch_alert(plate, violation, self._counts[key])
                 return True
         return False
 
-    def reset_plate(self, plate: str) -> None:
-        """Clear violation history for a plate (e.g., after manual review)."""
+    def reset_plate(self, plate: str):
+        """Clear all violation history for a plate (e.g. vehicle leaves scene)."""
         with self._lock:
-            self._history.pop(plate, None)
-            self._alerted.discard(plate)
+            keys = [k for k in self._counts if k.startswith(f"{plate}:")]
+            for k in keys:
+                del self._counts[k]
+                self._alerted.discard(k)
 
-    # ── Alert dispatch ─────────────────────────────────────────────────────
+    def get_stats(self) -> dict:
+        """Return current counts dict (copy) for API/reporting."""
+        with self._lock:
+            return {
+                "tracked_plates":  len(set(k.split(":")[0] for k in self._counts)),
+                "alerted_plates":  len(self._alerted),
+                "violation_counts": dict(self._counts),
+            }
 
-    def _send_alert(self, plate: str, events: list, camera: str) -> None:
-        subject = f"⚠ Repeat Traffic Violator Detected — {plate}"
-        body    = self._build_message_body(plate, events, camera)
-        self._send_email(subject, body)
-        self._send_sms(f"ANPR ALERT: Repeat violator {plate} — {len(events)} violations "
-                       f"at {camera}. Check dashboard.")
+    # ── Internal dispatch ───────────────────────────────────────────
 
-    @staticmethod
-    def _build_message_body(plate: str, events: list, camera: str) -> str:
-        lines = [
-            f"Smart City ANPR System — Repeat Violator Alert",
-            f"{'='*48}",
-            f"Plate         : {plate}",
-            f"Camera        : {camera}",
-            f"Generated at  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"",
-            f"Violation History (last {len(events)} events):",
-        ]
-        for i, (ts, viol) in enumerate(events, 1):
-            lines.append(f"  {i:2d}. [{ts.strftime('%H:%M:%S')}]  {viol}")
-        lines += ["", "Please review CCTV footage and take appropriate action.",
-                  "— SRM Smart City ANPR System"]
-        return "\n".join(lines)
+    def _dispatch_alert(self, plate: str, violation: str, count: int):
+        """Dispatch email and/or SMS in background threads."""
+        ts      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        subject = f"[ANPR ALERT] Repeat Violator — {plate}"
+        body    = (
+            f"⚠️  Repeat Violation Alert\n\n"
+            f"  Plate     : {plate}\n"
+            f"  Violation : {violation}\n"
+            f"  Count     : {count} times this session\n"
+            f"  Timestamp : {ts}\n\n"
+            f"This plate has been flagged {count} times. "
+            f"Please take appropriate action.\n\n"
+            f"— Smart City ANPR System (SRM IST)"
+        )
 
-    def _send_email(self, subject: str, body: str) -> None:
-        """Send alert email via SMTP. No-op if credentials not configured."""
-        smtp_host = os.getenv("ANPR_ALERT_SMTP_HOST", "smtp.gmail.com")
-        smtp_port = int(os.getenv("ANPR_ALERT_SMTP_PORT", "587"))
-        smtp_user = os.getenv("ANPR_ALERT_SMTP_USER", "")
-        smtp_pass = os.getenv("ANPR_ALERT_SMTP_PASS", "")
-        from_addr = os.getenv("ANPR_ALERT_EMAIL_FROM", smtp_user)
-        to_addrs  = [a.strip() for a in
-                     os.getenv("ANPR_ALERT_EMAIL_TO", "").split(",") if a.strip()]
+        log.warning(f"ALERT triggered: {plate} | {violation} × {count}")
 
-        if not smtp_user or not to_addrs:
-            log.debug("Email alert skipped — SMTP credentials not configured.")
-            return
+        if self.cfg is None:
+            return   # test mode — no actual sends
 
+        # Email
+        if self.cfg.alert_email_to and self.cfg.alert_smtp_user:
+            t = threading.Thread(
+                target=self._send_email,
+                args=(subject, body),
+                daemon=True,
+            )
+            t.start()
+
+        # SMS (Twilio)
+        if self.cfg.alert_twilio_sid and self.cfg.alert_sms_to:
+            sms_body = (
+                f"[ANPR ALERT] Repeat violator {plate}: "
+                f"{violation} x{count} at {ts}"
+            )
+            t = threading.Thread(
+                target=self._send_sms,
+                args=(sms_body,),
+                daemon=True,
+            )
+            t.start()
+
+    def _send_email(self, subject: str, body: str):
+        """Send SMTP email (TLS on port 587)."""
+        cfg = self.cfg
         try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject
-            msg["From"]    = from_addr
-            msg["To"]      = ", ".join(to_addrs)
+            msg                       = MIMEMultipart()
+            msg["From"]               = cfg.alert_email_from or cfg.alert_smtp_user
+            msg["To"]                 = cfg.alert_email_to
+            msg["Subject"]            = subject
             msg.attach(MIMEText(body, "plain"))
 
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+            with smtplib.SMTP(cfg.alert_smtp_host, cfg.alert_smtp_port) as server:
                 server.ehlo()
                 server.starttls()
-                server.login(smtp_user, smtp_pass)
-                server.sendmail(from_addr, to_addrs, msg.as_string())
-            log.info(f"Alert email sent to: {to_addrs}")
+                server.login(cfg.alert_smtp_user, cfg.alert_smtp_pass)
+                server.sendmail(msg["From"], [msg["To"]], msg.as_string())
+
+            log.info(f"  ✓ Email sent to {cfg.alert_email_to}")
         except Exception as e:
-            log.error(f"Email alert failed: {e}")
+            log.error(f"Email send failed: {e}")
 
-    def _send_sms(self, message: str) -> None:
-        """Send SMS via Twilio. No-op if credentials not configured."""
-        sid   = os.getenv("ANPR_TWILIO_SID", "")
-        token = os.getenv("ANPR_TWILIO_TOKEN", "")
-        to    = os.getenv("ANPR_ALERT_SMS_TO", "")
-        from_ = os.getenv("ANPR_ALERT_SMS_FROM", "")
-
-        if not all([sid, token, to, from_]):
-            log.debug("SMS alert skipped — Twilio credentials not configured.")
-            return
-
+    def _send_sms(self, body: str):
+        """Send SMS via Twilio REST API."""
+        cfg = self.cfg
         try:
             from twilio.rest import Client
-            client = Client(sid, token)
-            client.messages.create(body=message, from_=from_, to=to)
-            log.info(f"SMS alert sent to {to}")
+            client = Client(cfg.alert_twilio_sid, cfg.alert_twilio_token)
+            message = client.messages.create(
+                body = body,
+                from_= cfg.alert_sms_from,
+                to   = cfg.alert_sms_to,
+            )
+            log.info(f"  ✓ SMS sent: {message.sid}")
         except ImportError:
-            log.debug("twilio package not installed — SMS skipped.")
+            log.warning("twilio library not installed — SMS skipped. "
+                        "Install with: pip install twilio")
         except Exception as e:
-            log.error(f"SMS alert failed: {e}")
+            log.error(f"SMS send failed: {e}")
