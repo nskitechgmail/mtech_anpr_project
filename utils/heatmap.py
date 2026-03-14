@@ -1,164 +1,177 @@
 """
-utils/heatmap.py — Traffic density heatmap per junction per hour.
+utils/heatmap.py — Traffic density heatmap overlay (Sprint 3).
 
-Accumulates vehicle detection centroids in a spatial grid and renders
-an OpenCV-colourmap overlay on top of a road background image or blank canvas.
-Supports hourly snapshots and multi-camera junction comparison.
+Accumulates vehicle bounding-box centre positions across frames and
+renders a colour-coded OpenCV heat-map overlay on top of the video frame.
+Supports per-hour statistics and snapshot saving.
 """
+
 from __future__ import annotations
-import cv2, json, logging
-import numpy as np
-from pathlib import Path
-from datetime import datetime
+import cv2
+import logging
+import time
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
 
 log = logging.getLogger("Heatmap")
-
-# Colourmap: COLORMAP_JET gives blue(cold) → red(hot)
-_CMAP = cv2.COLORMAP_JET
-_DECAY = 0.98          # per-frame exponential decay so old detections fade
-_BLUR_SIGMA = 25       # Gaussian blur radius for smooth heat blobs
 
 
 class TrafficHeatmap:
     """
-    Maintains a floating-point density map the same size as the video frame.
+    Incremental traffic density heatmap.
 
-    Usage::
-        hm = TrafficHeatmap(width=1280, height=720)
-        hm.update(detections)          # call once per frame
-        overlay = hm.render(frame)     # BGR overlay image
-        hm.save_snapshot("out/")       # write hour-stamped PNG + JSON
+    Parameters
+    ----------
+    width, height : int
+        Frame dimensions (used to size the accumulator grid).
+    decay         : float
+        Per-frame decay factor (0–1). Lower = faster fade.
+    output_dir    : str
+        Directory where snapshot images are saved.
     """
 
-    def __init__(self, width: int = 1280, height: int = 720,
-                 decay: float = _DECAY, output_dir: str = "outputs/heatmaps"):
-        self.w      = width
-        self.h      = height
-        self.decay  = decay
-        self.outdir = Path(output_dir)
-        self.outdir.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        width:      int   = 1280,
+        height:     int   = 720,
+        decay:      float = 0.995,
+        output_dir: str   = "outputs/heatmaps",
+    ):
+        self.width      = width
+        self.height     = height
+        self.decay      = decay
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self._density  = np.zeros((height, width), dtype=np.float32)
-        self._counts   = defaultdict(int)     # {hour_str: total_vehicles}
-        self._frame_no = 0
-        self._last_hour = None
+        # Float accumulator grid (same resolution as frame)
+        self._density   = np.zeros((height, width), dtype=np.float32)
+        self._frame_count = 0
 
-    def update(self, detections: list) -> None:
+        # Hourly vehicle counts {hour_int: count}
+        self._hourly_counts: dict[int, int] = defaultdict(int)
+
+        # Gaussian spread kernel (radius ~30 px)
+        self._kernel = self._make_gaussian_kernel(radius=30)
+
+    # ── Public API ──────────────────────────────────────────────────
+
+    def update(self, detections: list):
         """
-        Add vehicle centroids from the current frame to the density map.
-        *detections* is a list of VehicleDetection objects.
+        Add vehicle positions from the current frame to the accumulator.
+
+        Parameters
+        ----------
+        detections : list[VehicleDetection]
+            Output from PlateRecogniser.process_frame().
         """
-        self._frame_no += 1
-        # Decay existing heat
+        self._frame_count += 1
+        hour = datetime.now().hour
+
+        # Decay existing density
         self._density *= self.decay
-
-        hour_key = datetime.now().strftime("%Y-%m-%d %H:00")
-        if self._last_hour and self._last_hour != hour_key:
-            # New hour started — save snapshot of the previous hour
-            log.info(f"Heatmap: saving hourly snapshot for {self._last_hour}")
-            self.save_snapshot(tag=self._last_hour.replace(":", "-").replace(" ", "_"))
-        self._last_hour = hour_key
 
         for det in detections:
             x1, y1, x2, y2 = det.bbox
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
-            cx = max(0, min(self.w - 1, cx))
-            cy = max(0, min(self.h - 1, cy))
-            # Add Gaussian blob at centroid
-            self._add_blob(cx, cy, radius=40)
-            self._counts[hour_key] += 1
+            self._add_gaussian(cx, cy)
+            self._hourly_counts[hour] += 1
 
-    def _add_blob(self, cx: int, cy: int, radius: int = 40) -> None:
-        """Add a soft circular hotspot at (cx, cy)."""
-        # Create a small patch
-        size   = radius * 2 + 1
-        patch  = np.zeros((size, size), dtype=np.float32)
-        cv2.circle(patch, (radius, radius), radius, 1.0, -1)
-        patch  = cv2.GaussianBlur(patch, (0, 0), _BLUR_SIGMA)
-
-        x1 = cx - radius;  y1 = cy - radius
-        x2 = cx + radius + 1; y2 = cy + radius + 1
-
-        # Clip to frame bounds
-        px1 = max(0, -x1);  py1 = max(0, -y1)
-        px2 = size - max(0, x2 - self.w)
-        py2 = size - max(0, y2 - self.h)
-        x1  = max(0, x1);  y1 = max(0, y1)
-        x2  = min(self.w, x2); y2 = min(self.h, y2)
-
-        if x2 > x1 and y2 > y1:
-            self._density[y1:y2, x1:x2] += patch[py1:py2, px1:px2]
-
-    def render(self, frame: np.ndarray, alpha: float = 0.55) -> np.ndarray:
+    def render(self, frame: np.ndarray, alpha: float = 0.45) -> np.ndarray:
         """
-        Render heatmap overlay on top of *frame*.
-        Returns a new BGR image (same size as frame).
+        Overlay the heatmap onto *frame* and return the blended result.
+        The original frame is NOT modified.
         """
+        h, w = frame.shape[:2]
+
+        # Resize density grid if frame size changed
+        density = self._density
+        if (h, w) != (self.height, self.width):
+            density = cv2.resize(density, (w, h))
+
         # Normalise to 0–255
-        d = self._density.copy()
-        max_val = d.max()
+        d_norm = density.copy()
+        max_val = d_norm.max()
         if max_val > 0:
-            d = (d / max_val * 255).astype(np.uint8)
+            d_norm = (d_norm / max_val * 255).astype(np.uint8)
         else:
-            d = d.astype(np.uint8)
+            d_norm = d_norm.astype(np.uint8)
 
-        # Apply colourmap
-        coloured = cv2.applyColorMap(d, _CMAP)
+        # Apply JET colour map
+        heatmap_colour = cv2.applyColorMap(d_norm, cv2.COLORMAP_JET)
 
-        # Blend over the frame
-        resized = cv2.resize(coloured, (frame.shape[1], frame.shape[0]))
-        overlay = cv2.addWeighted(frame, 1 - alpha, resized, alpha, 0)
-
-        # Draw legend
-        self._draw_legend(overlay)
-        return overlay
-
-    def _draw_legend(self, img: np.ndarray) -> None:
-        h, w = img.shape[:2]
-        # Gradient bar (20 px wide, 100 px tall)
-        bar_h, bar_w = 100, 20
-        bx, by = w - 60, h - 140
-        gradient = np.linspace(255, 0, bar_h, dtype=np.uint8).reshape(bar_h, 1)
-        gradient  = np.tile(gradient, (1, bar_w))
-        coloured  = cv2.applyColorMap(gradient, _CMAP)
-        img[by:by+bar_h, bx:bx+bar_w] = coloured
-        cv2.putText(img, "High", (bx + bar_w + 4, by + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
-        cv2.putText(img, "Low",  (bx + bar_w + 4, by + bar_h - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
-        cv2.putText(img, "Density", (bx - 4, by - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+        # Blend onto frame
+        result = cv2.addWeighted(frame, 1.0 - alpha, heatmap_colour, alpha, 0)
+        return result
 
     def save_snapshot(self, tag: str = "") -> Path:
-        """Save current density map as a PNG and summary JSON."""
-        ts   = tag or datetime.now().strftime("%Y%m%d_%H%M%S")
-        png  = self.outdir / f"heatmap_{ts}.png"
-        json_path = self.outdir / f"heatmap_{ts}.json"
+        """Save current density grid as a standalone PNG."""
+        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"heatmap_{ts}{'_' + tag if tag else ''}.png"
+        path  = self.output_dir / fname
 
-        # Render on blank dark background
-        bg = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        img = self.render(bg, alpha=0.85)
-        cv2.imwrite(str(png), img)
+        d_norm = self._density.copy()
+        max_val = d_norm.max()
+        if max_val > 0:
+            d_norm = (d_norm / max_val * 255).astype(np.uint8)
+        else:
+            d_norm = d_norm.astype(np.uint8)
 
-        summary = {
-            "snapshot_time" : ts,
-            "frame_count"   : self._frame_no,
-            "hourly_counts" : dict(self._counts),
-            "peak_hour"     : max(self._counts, key=self._counts.get)
-                              if self._counts else None,
-        }
-        json_path.write_text(json.dumps(summary, indent=2))
-        log.info(f"Heatmap snapshot saved: {png}")
-        return png
+        heatmap_colour = cv2.applyColorMap(d_norm, cv2.COLORMAP_JET)
+        cv2.imwrite(str(path), heatmap_colour)
+        log.info(f"Heatmap snapshot saved → {path}")
+        return path
 
     def get_stats(self) -> dict:
-        """Return a dict of heatmap stats for the API."""
+        """Return serialisable stats for REST API."""
         return {
-            "frame_count"   : self._frame_no,
-            "hourly_counts" : dict(self._counts),
-            "peak_hour"     : max(self._counts, key=self._counts.get)
-                              if self._counts else None,
-            "current_max_density": float(self._density.max()),
+            "frame_count"  : self._frame_count,
+            "peak_density" : float(self._density.max()),
+            "hourly_counts": dict(self._hourly_counts),
         }
+
+    def reset(self):
+        self._density[:] = 0
+        self._hourly_counts.clear()
+        self._frame_count = 0
+
+    # ── Internals ───────────────────────────────────────────────────
+
+    def _add_gaussian(self, cx: int, cy: int):
+        """Splat a 2-D Gaussian centred at (cx, cy) into the density grid."""
+        kr = self._kernel.shape[0] // 2  # half-radius
+        x1 = cx - kr
+        y1 = cy - kr
+        x2 = cx + kr + 1
+        y2 = cy + kr + 1
+
+        # Clip to grid bounds and compute corresponding kernel slice
+        gx1 = max(0, -x1)
+        gy1 = max(0, -y1)
+        gx2 = self._kernel.shape[1] - max(0, x2 - self.width)
+        gy2 = self._kernel.shape[0] - max(0, y2 - self.height)
+
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(self.width,  x2)
+        y2 = min(self.height, y2)
+
+        if x2 <= x1 or y2 <= y1 or gx2 <= gx1 or gy2 <= gy1:
+            return
+
+        self._density[y1:y2, x1:x2] += self._kernel[gy1:gy2, gx1:gx2]
+
+    @staticmethod
+    def _make_gaussian_kernel(radius: int = 30) -> np.ndarray:
+        size = 2 * radius + 1
+        k    = np.zeros((size, size), dtype=np.float32)
+        cx   = cy = radius
+        sigma = radius / 2.5
+        for y in range(size):
+            for x in range(size):
+                dist_sq = (x - cx) ** 2 + (y - cy) ** 2
+                k[y, x] = np.exp(-dist_sq / (2 * sigma ** 2))
+        return k / k.sum()   # normalise to unit mass
